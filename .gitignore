@@ -1,4 +1,6 @@
 ipsec_exporter
 
 .vscode
+.direnv
 
+dist/
