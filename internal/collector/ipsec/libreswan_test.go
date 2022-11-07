@@ -1,4 +1,4 @@
-package exporter
+package ipsecmetrics
 
 import (
 	"bytes"
@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/google/shlex"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )

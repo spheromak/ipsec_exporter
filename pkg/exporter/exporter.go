@@ -2,35 +2,28 @@
 package exporter
 
 import (
+	"context"
 	"fmt"
 	"math"
-	"net/url"
-	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
-)
-
-// Collector types.
-const (
-	CollectorVICI = iota
-	CollectorIpsec
+	"github.com/spheromak/ipsec_exporter/internal/collector"
+	"github.com/spheromak/ipsec_exporter/internal/ourlog"
+	"github.com/spheromak/ipsec_exporter/pkg/metric"
 )
 
 const namespace = "ipsec"
 
 var (
-	reSSMarker = regexp.MustCompile(`(?m)` + ssSAHeaderRE.String())
-	reLSMarker = regexp.MustCompile(`(?m)` + lsPrefix + `Connection list:$`)
-)
+	ikeSAStates   = make(map[string]float64)
+	childSAStates = make(map[string]float64)
 
-var (
+	now = time.Now
+	tz  = time.Local
+
 	ikeSALbls = []string{
 		"name",
 		"uid",
@@ -42,6 +35,7 @@ var (
 		"remote_identity",
 		"vips",
 	}
+
 	childSALbls = []string{
 		"ike_sa_name",
 		"ike_sa_uid",
@@ -60,26 +54,65 @@ var (
 		"local_ts",
 		"remote_ts",
 	}
-)
-var (
-	ikeSAStates   = make(map[string]float64)
-	childSAStates = make(map[string]float64)
-)
 
-var (
-	now = time.Now
-	tz  = time.Local
+	lsStates = map[string]float64{
+		"STATE_MAIN_R0":        0,
+		"STATE_MAIN_I1":        1,
+		"STATE_MAIN_R1":        2,
+		"STATE_MAIN_I2":        3,
+		"STATE_MAIN_R2":        4,
+		"STATE_MAIN_I3":        5,
+		"STATE_MAIN_R3":        6,
+		"STATE_MAIN_I4":        7,
+		"STATE_AGGR_R0":        8,
+		"STATE_AGGR_I1":        9,
+		"STATE_AGGR_R1":        10,
+		"STATE_AGGR_I2":        11,
+		"STATE_AGGR_R2":        12,
+		"STATE_QUICK_R0":       13,
+		"STATE_QUICK_I1":       14,
+		"STATE_QUICK_R1":       15,
+		"STATE_QUICK_I2":       16,
+		"STATE_QUICK_R2":       17,
+		"STATE_INFO":           18,
+		"STATE_INFO_PROTECTED": 19,
+		"STATE_XAUTH_R0":       20,
+		"STATE_XAUTH_R1":       21,
+		"STATE_MODE_CFG_R0":    22,
+		"STATE_MODE_CFG_R1":    23,
+		"STATE_MODE_CFG_R2":    24,
+		"STATE_MODE_CFG_I1":    25,
+		"STATE_XAUTH_I0":       26,
+		"STATE_XAUTH_I1":       27,
+
+		"STATE_V2_PARENT_I0":            29,
+		"STATE_V2_PARENT_I1":            30,
+		"STATE_V2_PARENT_I2":            31,
+		"STATE_V2_PARENT_R0":            32,
+		"STATE_V2_PARENT_R1":            33,
+		"STATE_V2_IKE_AUTH_CHILD_I0":    34,
+		"STATE_V2_IKE_AUTH_CHILD_R0":    35,
+		"STATE_V2_NEW_CHILD_I0":         36,
+		"STATE_V2_NEW_CHILD_I1":         37,
+		"STATE_V2_REKEY_IKE_I0":         38,
+		"STATE_V2_REKEY_IKE_I1":         39,
+		"STATE_V2_REKEY_CHILD_I0":       40,
+		"STATE_V2_REKEY_CHILD_I1":       41,
+		"STATE_V2_NEW_CHILD_R0":         42,
+		"STATE_V2_REKEY_IKE_R0":         43,
+		"STATE_V2_REKEY_CHILD_R0":       44,
+		"STATE_V2_ESTABLISHED_IKE_SA":   45,
+		"STATE_V2_ESTABLISHED_CHILD_SA": 46,
+		"STATE_V2_IKE_SA_DELETE":        47,
+		"STATE_V2_CHILD_SA_DELETE":      48,
+	}
 )
 
 // Exporter collects IPsec stats via a VICI protocol or an ipsec binary
 // and exports them using the prometheus metrics package.
 type Exporter struct {
-	scrape   func(e *Exporter) (m metrics, ok bool)
-	address  *url.URL
-	timeout  time.Duration
-	ipsecCmd []string
-	logger   log.Logger
-	mu       sync.Mutex
+	collector collector.Scraper
+	logCTX    context.Context
 
 	up                *prometheus.Desc
 	uptime            *prometheus.Desc
@@ -129,43 +162,26 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 // Collect fetches the statistics from strongswan/libreswan, and
 // delivers them as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
-	m, ok := e.scrape(e)
-	if !ok {
+	var err error
+	m, err := e.collector.Scrape()
+	if err != nil {
+		ourlog.Error("msg", "Failed to scrape", "err", err, "metric", m)
 		ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
 		return
 	}
 
-	e.collect(m, ch)
-}
-
-func (e *Exporter) scrapeIpsec() (m metrics, ok bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	cmd := exec.Command(e.ipsecCmd[0], e.ipsecCmd[1:]...)
-	output, err := cmd.CombinedOutput()
+	err = e.collect(m, ch)
 	if err != nil {
-		level.Error(e.logger).Log("msg", "Failed to execute command", "cmd", cmd, "output", output, "err", err)
-		return
+		ourlog.Error("msg", "Failed to process", "err", err)
 	}
-	switch {
-	case reSSMarker.Match(output):
-		level.Debug(e.logger).Log("msg", "Output type is detected as strongswan", "cmd", cmd)
-		return e.scrapeStrongswan(output)
-	case reLSMarker.Match(output):
-		level.Debug(e.logger).Log("msg", "Output type is detected as libreswan", "cmd", cmd)
-		return e.scrapeLibreswan(output)
-	}
-	level.Error(e.logger).Log("msg", "Failed to recognize output type", "cmd", cmd, "output", output)
-	return
 }
 
-func (e *Exporter) collect(m metrics, ch chan<- prometheus.Metric) {
+func (e *Exporter) collect(m metric.Metrics, ch chan<- prometheus.Metric) error {
 	if m.Stats.Uptime.Since != "" {
 		uptime, err := time.ParseInLocation("Jan _2 15:04:05 2006", m.Stats.Uptime.Since, tz)
 		if err != nil {
 			ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
-			level.Error(e.logger).Log("msg", "Failed to parse uptime", "uptime", m.Stats.Uptime.Since, "err", err)
-			return
+			return fmt.Errorf("Failed to parse uptime '%s': %w", m.Stats.Uptime, err)
 		}
 		ch <- prometheus.MustNewConstMetric(e.uptime, prometheus.GaugeValue, now().Round(time.Second).Sub(uptime).Seconds())
 	}
@@ -244,15 +260,18 @@ func (e *Exporter) collect(m metrics, ch chan<- prometheus.Metric) {
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 1)
+	return nil
 }
 
 // New returns an initialized exporter.
-func New(collectorType int, address *url.URL, timeout time.Duration, ipsecCmd []string, logger log.Logger) (*Exporter, error) {
+func New(c collector.Scraper) (*Exporter, error) {
+	for k, v := range lsStates {
+		ikeSAStates[k] = v
+		childSAStates[k] = v
+	}
+
 	e := &Exporter{
-		address:  address,
-		timeout:  timeout,
-		ipsecCmd: ipsecCmd,
-		logger:   logger,
+		collector: c,
 
 		up: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "up"),
@@ -272,9 +291,7 @@ func New(collectorType int, address *url.URL, timeout time.Duration, ipsecCmd []
 			nil,
 			nil,
 		),
-		idleWorkers: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "", "idle_workers"),
-			"Number of idle worker threads.",
+		idleWorkers: prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "idle_workers"), "Number of idle worker threads.",
 			nil,
 			nil,
 		),
@@ -369,13 +386,6 @@ func New(collectorType int, address *url.URL, timeout time.Duration, ipsecCmd []
 			nil,
 		),
 	}
-	switch collectorType {
-	case CollectorVICI:
-		e.scrape = (*Exporter).scrapeVICI
-	case CollectorIpsec:
-		e.scrape = (*Exporter).scrapeIpsec
-	default:
-		return nil, fmt.Errorf("unknown collector type %d", collectorType)
-	}
+
 	return e, nil
 }

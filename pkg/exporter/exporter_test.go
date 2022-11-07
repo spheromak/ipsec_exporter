@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/google/shlex"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -18,7 +18,12 @@ func TestMain(m *testing.M) {
 }
 
 func TestExporter_Collect(t *testing.T) {
-	exporter, err := New(CollectorIpsec, nil, 0, nil, log.NewNopLogger())
+	exporter, err := New(&Config{
+		Type:    CollectorIpsec,
+		Address: nil,
+		Timeout: 0,
+		Logger:  log.NewNopLogger(),
+	})
 	if err != nil {
 		t.Fatalf("New() = _, %v; want nil", err)
 	}
@@ -156,7 +161,12 @@ func TestExporter_Collect_Unknown(t *testing.T) {
 		t.Skip("skipping TestExporter_Collect_Unknown during short test")
 	}
 	cmd, _ := shlex.Split("docker-compose -f ../testdata/docker/libreswan/docker-compose.yml exec -T moon /bin/ls")
-	exporter, err := New(CollectorIpsec, nil, time.Second, cmd, log.NewNopLogger())
+	exporter, err := New(&Config{
+		Type:    CollectorIpsec,
+		Address: nil,
+		Timeout: time.Second,
+		Logger:  log.NewNopLogger(),
+	})
 	if err != nil {
 		t.Fatalf("New() = _, %v; want nil", err)
 	}
