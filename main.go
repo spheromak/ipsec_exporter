@@ -44,6 +44,7 @@ func newCmd(s kingpin.Settings) (target *[]string) {
 func main() {
 	var (
 		address     = kingpin.Flag("vici.address", "VICI socket address.").PlaceHolder(`"` + viciDefaultAddress + `"`).Default(viciDefaultAddress).URL()
+		gometrics   = kingpin.Flag("gometrics", "Enable exporting of go runtime metrics").Bool()
 		timeout     = kingpin.Flag("vici.timeout", "VICI socket connect timeout.").Default("1s").Duration()
 		collector   = kingpin.Flag("collector", "Collector type to scrape metrics with. One of: [vici, ipsec]").Default(viciFlag).Enum(viciFlag, ipsecFlag)
 		metricsPath = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
@@ -59,7 +60,6 @@ func main() {
 	ourlog.Info("msg", "Starting ipsec_exporter", "version", version.Info())
 	ourlog.Info("msg", "Build context", "context", version.BuildContext())
 	//ipsecCmd := []string{"ipsec", "statusall"}
-	prometheus.MustRegister(version.NewCollector("ipsec_exporter"))
 
 	var err error
 	var c col.Scraper
@@ -85,9 +85,19 @@ func main() {
 		level.Error(ourlog.Default).Log("msg", "Error creating the exporter", "err", err)
 		os.Exit(1)
 	}
-	prometheus.MustRegister(exporter)
 
-	http.Handle(*metricsPath, promhttp.Handler())
+	// if asked to export go metrics use the default prometheus registry otherwise just use one with our metrics
+	r := prometheus.NewRegistry()
+	r.MustRegister(version.NewCollector("ipsec_exporter"))
+	r.MustRegister(exporter)
+	handler := promhttp.HandlerFor(r, promhttp.HandlerOpts{})
+	if *gometrics {
+		prometheus.MustRegister(version.NewCollector("ipsec_exporter"))
+		prometheus.MustRegister(exporter)
+		handler = promhttp.Handler()
+	}
+	http.Handle(*metricsPath, handler)
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
              <head><title>IPsec Exporter</title></head>
